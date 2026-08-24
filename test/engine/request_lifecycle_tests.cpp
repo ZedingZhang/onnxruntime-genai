@@ -7,8 +7,10 @@
 // create/assign/schedule/continue/remove move a request between Unassigned, Assigned, Active,
 // TurnComplete, and Closed.
 
+#include <barrier>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -17,6 +19,7 @@
 #include "engine_test_helpers.h"
 #include "engine_test_doubles.h"
 #include "engine/request_status.h"
+#include "constrained_logits_processor.h"
 
 namespace Generators {
 namespace test {
@@ -24,24 +27,8 @@ namespace {
 
 std::vector<int32_t> Prompt() { return {2, 3, 4}; }
 
-DeviceSpan<float> LogitsForToken(Model& model, int32_t token) {
-  auto logits = model.p_device_inputs_->Allocate<float>(
-      static_cast<size_t>(model.config_->model.vocab_size));
-  auto cpu_logits = logits.CpuSpan();
-  std::fill(cpu_logits.begin(), cpu_logits.end(), 0.0f);
-  cpu_logits[token] = 100.0f;
-  logits.CopyCpuToDevice();
-  return logits;
-}
-
-DeviceSpan<float> LogitsFavoringToken(Model& model, int32_t preferred_token,
-                                      int32_t fallback_token) {
-  auto logits = LogitsForToken(model, preferred_token);
-  logits.CpuSpan()[fallback_token] = 50.0f;
-  logits.CopyCpuToDevice();
-  return logits;
-}
-
+// LogitsForToken / LogitsFavoringToken now live in engine_test_helpers.h so guidance_processor_tests.cpp
+// can share them.
 struct FailingContinuationControl {
   bool fail_append{};
   bool fail_restore{};
@@ -586,6 +573,178 @@ TEST_F(RequestLifecycleTest, RequestRejectsIncompleteGuidanceConfiguration) {
 }
 
 #if USE_GUIDANCE
+TEST_F(RequestLifecycleTest, GuidanceCacheReusesTokenizerAndCompiledGrammar) {
+  auto guidance_model = CreateModel(
+      GetOrtEnv(), MODEL_PATH "hf-internal-testing/tiny-random-gpt2-fp32");
+
+  auto first_params = MakeGreedyParams(*guidance_model);
+  first_params->SetGuidance("regex", "!", false);
+  auto first_request = std::make_shared<Request>(first_params);
+
+  auto second_params = MakeGreedyParams(*guidance_model);
+  second_params->SetGuidance("regex", "!", false);
+  auto second_request = std::make_shared<Request>(second_params);
+
+  const auto stats = GetGuidanceCacheStats(*guidance_model);
+  EXPECT_EQ(stats.tokenizer_initializations, 1u);
+  EXPECT_EQ(stats.grammar_misses, 1u);
+  EXPECT_EQ(stats.grammar_hits, 1u);
+  EXPECT_EQ(stats.cached_grammars, 1u);
+  EXPECT_GT(stats.cached_key_bytes, 0u);
+}
+
+TEST_F(RequestLifecycleTest, GuidanceCacheSingleFlightsConcurrentIdenticalGrammars) {
+  auto guidance_model = CreateModel(
+      GetOrtEnv(), MODEL_PATH "hf-internal-testing/tiny-random-gpt2-fp32");
+  constexpr size_t kRequestCount = 8;
+  std::barrier gate(static_cast<std::ptrdiff_t>(kRequestCount));
+  std::vector<std::exception_ptr> errors(kRequestCount);
+  std::vector<std::thread> threads;
+  threads.reserve(kRequestCount);
+
+  for (size_t i = 0; i < kRequestCount; ++i) {
+    threads.emplace_back([&, i] {
+      try {
+        gate.arrive_and_wait();
+        auto params = MakeGreedyParams(*guidance_model);
+        params->SetGuidance("regex", "!", false);
+        auto request = std::make_shared<Request>(params);
+        static_cast<void>(request);
+      } catch (...) {
+        errors[i] = std::current_exception();
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  for (const auto& error : errors) {
+    EXPECT_EQ(error, nullptr);
+  }
+
+  const auto stats = GetGuidanceCacheStats(*guidance_model);
+  EXPECT_EQ(stats.tokenizer_initializations, 1u);
+  EXPECT_EQ(stats.grammar_misses, 1u);
+  EXPECT_EQ(stats.grammar_hits + stats.grammar_waits, kRequestCount - 1);
+}
+
+TEST_F(RequestLifecycleTest, GuidanceCacheIsolatesConcurrentUniqueGrammars) {
+  auto guidance_model = CreateModel(
+      GetOrtEnv(), MODEL_PATH "hf-internal-testing/tiny-random-gpt2-fp32");
+  constexpr size_t kRequestCount = 8;
+  std::barrier gate(static_cast<std::ptrdiff_t>(kRequestCount));
+  std::vector<std::exception_ptr> errors(kRequestCount);
+  std::vector<std::thread> threads;
+  threads.reserve(kRequestCount);
+
+  for (size_t i = 0; i < kRequestCount; ++i) {
+    threads.emplace_back([&, i] {
+      try {
+        gate.arrive_and_wait();
+        auto params = MakeGreedyParams(*guidance_model);
+        const std::string grammar(1, static_cast<char>('a' + i));
+        params->SetGuidance("regex", grammar.c_str(), false);
+        auto request = std::make_shared<Request>(params);
+        static_cast<void>(request);
+      } catch (...) {
+        errors[i] = std::current_exception();
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  for (const auto& error : errors) {
+    EXPECT_EQ(error, nullptr);
+  }
+
+  const auto stats = GetGuidanceCacheStats(*guidance_model);
+  EXPECT_EQ(stats.tokenizer_initializations, 1u);
+  EXPECT_EQ(stats.grammar_misses, kRequestCount);
+  EXPECT_EQ(stats.cached_grammars, kRequestCount);
+}
+
+TEST_F(RequestLifecycleTest, GuidanceClonesScheduleDirtyMasksIndependently) {
+  auto guidance_model = CreateModel(
+      GetOrtEnv(), MODEL_PATH "hf-internal-testing/tiny-random-gpt2-fp32");
+  auto tokenizer = guidance_model->CreateTokenizer();
+  const auto expected_tokens = tokenizer->Encode("!");
+  ASSERT_EQ(expected_tokens.size(), 1u);
+
+  auto params = MakeGreedyParams(*guidance_model);
+  params->SetGuidance("regex", "!!", false);
+  auto processor = CreateGuidanceLogitsProcessor(*guidance_model, params);
+  processor->ProcessLogits(LogitsForToken(*guidance_model, expected_tokens.front()));
+  int32_t token = expected_tokens.front();
+  processor->CommitTokens(std::span<int32_t>{&token, 1});
+  auto clone = processor->Clone();
+
+  std::barrier gate(2);
+  std::exception_ptr errors[2];
+  std::thread original_thread([&] {
+    try {
+      gate.arrive_and_wait();
+      processor->ProcessLogits(LogitsForToken(*guidance_model, expected_tokens.front()));
+    } catch (...) {
+      errors[0] = std::current_exception();
+    }
+  });
+  std::thread clone_thread([&] {
+    try {
+      gate.arrive_and_wait();
+      clone->ProcessLogits(LogitsForToken(*guidance_model, expected_tokens.front()));
+    } catch (...) {
+      errors[1] = std::current_exception();
+    }
+  });
+  original_thread.join();
+  clone_thread.join();
+
+  EXPECT_EQ(errors[0], nullptr);
+  EXPECT_EQ(errors[1], nullptr);
+}
+
+TEST_F(RequestLifecycleTest, GuidanceCacheEvictionKeepsLiveProcessorAssetsValid) {
+  auto guidance_model = CreateModel(
+      GetOrtEnv(), MODEL_PATH "hf-internal-testing/tiny-random-gpt2-fp32");
+
+  auto first_params = MakeGreedyParams(*guidance_model);
+  first_params->SetGuidance("regex", "first", false);
+  auto first_processor = CreateGuidanceLogitsProcessor(*guidance_model, first_params);
+
+  for (size_t i = 0; i < 65; ++i) {
+    auto params = MakeGreedyParams(*guidance_model);
+    const auto grammar = "value" + std::to_string(i);
+    params->SetGuidance("regex", grammar.c_str(), false);
+    auto processor = CreateGuidanceLogitsProcessor(*guidance_model, params);
+    static_cast<void>(processor);
+  }
+
+  const auto stats = GetGuidanceCacheStats(*guidance_model);
+  EXPECT_GT(stats.grammar_evictions, 0u);
+  const auto first_tokens = guidance_model->CreateTokenizer()->Encode("first");
+  ASSERT_FALSE(first_tokens.empty());
+  int32_t first_token = first_tokens.front();
+  EXPECT_NO_THROW(first_processor->CommitTokens(std::span<int32_t>{&first_token, 1}));
+  EXPECT_NO_THROW(first_processor->GetReadyMask());
+  first_processor.reset();
+}
+
+TEST_F(RequestLifecycleTest, GuidanceCacheDoesNotRetainFailedCompilations) {
+  auto guidance_model = CreateModel(
+      GetOrtEnv(), MODEL_PATH "hf-internal-testing/tiny-random-gpt2-fp32");
+
+  for (size_t attempt = 1; attempt <= 2; ++attempt) {
+    auto params = MakeGreedyParams(*guidance_model);
+    params->SetGuidance("regex", "[", false);
+    EXPECT_THROW(CreateGuidanceLogitsProcessor(*guidance_model, params), std::runtime_error);
+
+    const auto stats = GetGuidanceCacheStats(*guidance_model);
+    EXPECT_EQ(stats.grammar_misses, attempt);
+    EXPECT_EQ(stats.cached_grammars, 0u);
+  }
+}
+
 TEST_F(RequestLifecycleTest, GuidanceMasksTokensAndRollsBackWithSearchState) {
   auto guidance_model = CreateModel(
       GetOrtEnv(), MODEL_PATH "hf-internal-testing/tiny-random-gpt2-fp32");
@@ -653,6 +812,41 @@ TEST_F(RequestLifecycleTest, StaticCpuGenerationAdvancesGuidanceCursor) {
   request->GenerateNextTokens(second_logits);
   request->CompleteGeneration();
   EXPECT_EQ(request->UnseenToken(), second_tokens.front());
+}
+
+TEST_F(RequestLifecycleTest, RealGuidanceContinuationRestartsGrammarAtFirstToken) {
+  auto guidance_model = CreateModel(
+      GetOrtEnv(), MODEL_PATH "hf-internal-testing/tiny-random-gpt2-fp32");
+  auto guidance_engine = MakeDoublesEngine(guidance_model, /*capacity=*/8,
+                                           EosToken(*guidance_model));
+  auto tokenizer = guidance_model->CreateTokenizer();
+  const auto expected_tokens = tokenizer->Encode("!");
+  const auto invalid_tokens = tokenizer->Encode("a");
+  ASSERT_EQ(expected_tokens.size(), 1u);
+  ASSERT_EQ(invalid_tokens.size(), 1u);
+
+  auto params = MakeGreedyParams(*guidance_model);
+  params->search.max_length = static_cast<int32_t>(Prompt().size()) + 8;
+  params->SetGuidance("regex", "!", false);
+  auto request = std::make_shared<Request>(params);
+  request->AddTokens(Prompt());
+  guidance_engine.engine->AddRequest(request);
+
+  guidance_engine.executor->SetForcedToken(invalid_tokens.front());
+  ASSERT_EQ(guidance_engine.engine->Step(), request);
+  EXPECT_EQ(request->UnseenToken(), expected_tokens.front());
+
+  // Once the one-token regex is complete, the fresh mask allows only EOS and completes the turn.
+  guidance_engine.executor->SetForcedToken(invalid_tokens.front());
+  ASSERT_EQ(guidance_engine.engine->Step(), request);
+  ASSERT_TRUE(request->IsTurnComplete());
+
+  request->Continue(std::vector<int32_t>{6});
+
+  // The new turn must restart at the grammar's first token, not remain at the completed EOS-only cursor.
+  guidance_engine.executor->SetForcedToken(invalid_tokens.front());
+  ASSERT_EQ(guidance_engine.engine->Step(), request);
+  EXPECT_EQ(request->UnseenToken(), expected_tokens.front());
 }
 #endif
 

@@ -429,6 +429,7 @@ std::shared_ptr<Request> Engine::StepDynamic() {
         step_plan_.requests[i].request->CommitStep(
             step_plan_.requests[i], step_results_[i]);
       }
+      scheduled_requests.ScheduleGuidanceMasks();
     } catch (...) {
       MarkUnhealthyAndThrow(
           StepOutcomeKind::ExecutionContractFailure,

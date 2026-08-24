@@ -115,7 +115,7 @@ child benchmark output is opt-in with `--verbose`.
 | `prompt_length_k` | RULER prompt length in thousands of tokens; `long_prefill` supports 32, 64, and 128. |
 | `model_path` | Folder containing the ONNX model and `genai_config.json`. |
 | `execution_provider` | e.g. `cuda`. |
-| `execution_provider_library` | Path to the provider plugin. Required for `cuda`, registered once per process. |
+| `execution_provider_library` | Optional path to a provider plugin, registered once per process. Omit it when using a source-built ORT whose provider is loaded through the legacy provider path. |
 | `generation_tokens` | Tokens generated per request. |
 
 ## Adding a scenario
