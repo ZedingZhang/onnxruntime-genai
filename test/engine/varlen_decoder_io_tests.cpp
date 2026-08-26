@@ -1,16 +1,40 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <array>
 #include <limits>
 
 #include <gtest/gtest.h>
 
+#include "engine/decoders/simple_decoder.h"
 #include "engine/decoders/varlen_decoder_io.h"
 #include "engine/paged_key_value_cache.h"
 
 namespace Generators {
 namespace test {
 namespace {
+
+TEST(VarlenDecoderIOTest, PackedHybridPositionIdsRequireInt64TokenVector) {
+  EXPECT_NO_THROW(ValidatePackedPositionIdsInput(
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+      std::array<int64_t, 1>{-1}));
+  EXPECT_THROW(ValidatePackedPositionIdsInput(
+                   ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                   std::array<int64_t, 2>{-1, -1}),
+               std::runtime_error);
+  EXPECT_THROW(ValidatePackedPositionIdsInput(
+                   ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
+                   std::array<int64_t, 1>{-1}),
+               std::runtime_error);
+  EXPECT_THROW(ValidatePackedPositionIdsInput(
+                   ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                   std::array<int64_t, 1>{1}),
+               std::runtime_error);
+  EXPECT_THROW(ValidatePackedPositionIdsInput(
+                   ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                   std::array<int64_t, 1>{0}),
+               std::runtime_error);
+}
 
 TEST(VarlenDecoderIOTest, EagerMetadataUsesExactStepBounds) {
   StepPlan plan;

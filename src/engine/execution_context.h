@@ -19,8 +19,8 @@ struct ExecutionContext {
   const StepPlan* plan{};
   PagedCacheReservation* cache_reservation{};
   // Fixed decoder-state resources for this step, in scheduled request row order. Empty when the
-  // model has no fixed groups. The production executor forwards these to the decoder, but
-  // VarlenDecoderIO does not bind them yet, so their presence integrates ownership only.
+  // model has no fixed groups. HybridDecoderIO binds these gathered inputs and staged outputs
+  // alongside the packed variable-length inputs.
   std::span<const FixedStateSlotHandle> fixed_state_slots;
   std::span<const FixedStateBinding> fixed_state_bindings;
   size_t fixed_state_staging_bytes{};
